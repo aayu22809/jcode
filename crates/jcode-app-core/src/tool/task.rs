@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -215,11 +216,16 @@ impl Tool for SubagentTool {
         );
 
         let start = std::time::Instant::now();
+        let prompt = prompt_with_subagent_instructions(
+            &params.prompt,
+            &params.subagent_type,
+            ctx.working_dir.as_deref(),
+        );
         // Bound the wait so a stuck/hung child turn (e.g. a model that never
         // emits a final answer) cannot block the caller indefinitely. `0`
         // disables the bound. See issue #365.
         let timeout_secs = crate::config::config().agents.subagent_timeout_secs;
-        let run_fut = agent.run_once_capture(&params.prompt);
+        let run_fut = agent.run_once_capture(&prompt);
         let run_result = if timeout_secs == 0 {
             run_fut.await
         } else {
@@ -315,6 +321,76 @@ fn subagent_display_title(params: &SubagentInput, model: &str) -> String {
         "{} ({} · {})",
         params.description, params.subagent_type, model
     )
+}
+
+fn prompt_with_subagent_instructions(
+    prompt: &str,
+    subagent_type: &str,
+    working_dir: Option<&Path>,
+) -> String {
+    match load_subagent_instructions(subagent_type, working_dir) {
+        Some(instructions) => {
+            format!("# Subagent Type: {subagent_type}\n\n{instructions}\n\n# Task\n\n{prompt}")
+        }
+        None => prompt.to_string(),
+    }
+}
+
+fn load_subagent_instructions(subagent_type: &str, working_dir: Option<&Path>) -> Option<String> {
+    for path in subagent_instruction_candidates(subagent_type, working_dir) {
+        if path.is_file()
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            return Some(strip_markdown_frontmatter(&content).trim().to_string());
+        }
+    }
+    None
+}
+
+fn subagent_instruction_candidates(
+    subagent_type: &str,
+    working_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let file_name = format!("{subagent_type}.md");
+
+    if let Some(dir) = working_dir {
+        candidates.push(dir.join(".jcode/agents").join(&file_name));
+        candidates.push(dir.join(".claude/agents").join(&file_name));
+    }
+
+    if let Ok(jcode_dir) = crate::storage::jcode_dir() {
+        candidates.push(jcode_dir.join("agents").join(&file_name));
+        let plugins_dir = jcode_dir.join("plugins");
+        if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                candidates.push(path.join("agents").join(&file_name));
+                if let Ok(children) = std::fs::read_dir(&path) {
+                    for child in children.flatten() {
+                        candidates.push(child.path().join("agents").join(&file_name));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(claude_agent) =
+        crate::storage::user_home_path(".claude/agents").map(|p| p.join(&file_name))
+    {
+        candidates.push(claude_agent);
+    }
+
+    candidates
+}
+
+fn strip_markdown_frontmatter(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return content;
+    };
+    rest.split_once("\n---\n")
+        .map(|(_, body)| body)
+        .unwrap_or(content)
 }
 
 impl SubagentOutputMode {
@@ -447,6 +523,23 @@ mod tests {
         assert_eq!(
             super::SubagentTool::resolve_model(None, None, None, "provider"),
             configured_or_provider
+        );
+    }
+
+    #[test]
+    fn strip_markdown_frontmatter_removes_cursor_agent_metadata() {
+        let content = "---\nname: ci-watcher\nmodel: fast\n---\n\n# CI watcher\n\nWatch checks.";
+        assert_eq!(
+            super::strip_markdown_frontmatter(content).trim(),
+            "# CI watcher\n\nWatch checks."
+        );
+    }
+
+    #[test]
+    fn prompt_with_subagent_instructions_falls_back_without_agent_file() {
+        assert_eq!(
+            super::prompt_with_subagent_instructions("do it", "missing-agent", None),
+            "do it"
         );
     }
 

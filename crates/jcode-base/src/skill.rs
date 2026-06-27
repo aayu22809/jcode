@@ -217,6 +217,16 @@ impl SkillRegistry {
             if jcode_skills.exists() {
                 registry.load_from_dir(&jcode_skills)?;
             }
+
+            // Load bundled plugin skills from ~/.jcode/plugins/<plugin>/skills/.
+            // Cursor plugins use this layout and contain many useful skills in
+            // nested plugin directories rather than one flat skills directory.
+            let plugins_dir = jcode_dir.join("plugins");
+            if plugins_dir.is_dir() {
+                for skills_dir in plugin_resource_dirs(&plugins_dir, "skills") {
+                    registry.load_from_dir(&skills_dir)?;
+                }
+            }
         }
 
         registry.load_project_local_dirs(working_dir)?;
@@ -628,6 +638,32 @@ pub const ENDORSED_SKILLS: &[EndorsedSkill] = &[
 /// Return the curated list of skills endorsed by jcode.
 pub fn endorsed_skills() -> &'static [EndorsedSkill] {
     ENDORSED_SKILLS
+}
+
+fn plugin_resource_dirs(plugins_dir: &Path, resource_name: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let Ok(entries) = std::fs::read_dir(plugins_dir) else {
+        return dirs;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let direct = path.join(resource_name);
+        if direct.is_dir() {
+            dirs.push(direct);
+        }
+
+        if let Ok(children) = std::fs::read_dir(&path) {
+            for child in children.flatten() {
+                let nested = child.path().join(resource_name);
+                if nested.is_dir() {
+                    dirs.push(nested);
+                }
+            }
+        }
+    }
+
+    dirs
 }
 
 impl Skill {
